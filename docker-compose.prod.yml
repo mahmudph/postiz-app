@@ -1,0 +1,152 @@
+# ==========================================================================
+# PRODUCTION (VPS) - standalone compose for Postiz behind the shared Traefik
+# instance in /home/mahmud/server/treafik.
+#
+# This file is NOT an overlay. Run it on its own:
+#
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Differences from the upstream docker-compose.yaml, on purpose:
+#   - no published host ports; the only way in is Traefik over the external
+#     `traefik` network
+#   - debug services dropped (spotlight, temporal-ui, temporal-admin-tools)
+#   - Temporal runs without Elasticsearch (standard visibility in postgres);
+#     the VPS only has ~3.8 GB RAM
+#
+# Prerequisites on the host:
+#   docker network create traefik    # already exists on this VPS
+#   .env                             # copy from .env.prod.example
+# ==========================================================================
+
+services:
+  postiz:
+    image: ${POSTIZ_IMAGE:-ghcr.io/mahmudph/postiz-app:latest}
+    container_name: postiz
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTIZ_DB_USER}:${POSTIZ_DB_PASSWORD}@postiz-postgres:5432/${POSTIZ_DB_NAME}
+      REDIS_URL: redis://postiz-redis:6379
+      TEMPORAL_ADDRESS: temporal:7233
+    volumes:
+      - postiz-config:/config
+      - postiz-uploads:/uploads
+    depends_on:
+      postiz-postgres:
+        condition: service_healthy
+      postiz-redis:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    networks:
+      - internal
+      - temporal
+      - traefik
+    healthcheck:
+      # /api/ is proxied by nginx to the NestJS backend, so this fails when
+      # either nginx or the backend is wedged. Any non-5xx answer means alive.
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:5000/api/').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik
+      - traefik.http.routers.postiz.rule=Host(`${POSTIZ_DOMAIN}`)
+      - traefik.http.routers.postiz.entrypoints=web
+      - traefik.http.routers.postiz.middlewares=postiz-redirect
+
+      - traefik.http.routers.postiz-secure.rule=Host(`${POSTIZ_DOMAIN}`)
+      - traefik.http.routers.postiz-secure.entrypoints=websecure
+      - traefik.http.routers.postiz-secure.tls=true
+      - traefik.http.routers.postiz-secure.tls.certresolver=letsencrypt
+
+      - traefik.http.services.postiz.loadbalancer.server.port=5000
+      - traefik.http.middlewares.postiz-redirect.redirectscheme.scheme=https
+
+  postiz-postgres:
+    image: postgres:17-alpine
+    container_name: postiz-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTIZ_DB_USER}
+      POSTGRES_PASSWORD: ${POSTIZ_DB_PASSWORD}
+      POSTGRES_DB: ${POSTIZ_DB_NAME}
+    volumes:
+      - postgres-volume:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTIZ_DB_USER} -d ${POSTIZ_DB_NAME}"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  postiz-redis:
+    image: redis:7.2
+    container_name: postiz-redis
+    restart: always
+    volumes:
+      - postiz-redis-data:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # -----------------------
+  # Temporal (scheduling)
+  # -----------------------
+  temporal-postgresql:
+    image: postgres:16
+    container_name: temporal-postgresql
+    restart: always
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${TEMPORAL_DB_PASSWORD}
+    volumes:
+      - temporal-postgres-volume:/var/lib/postgresql/data
+    networks:
+      - temporal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.28.1
+    container_name: temporal
+    restart: always
+    depends_on:
+      temporal-postgresql:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=${TEMPORAL_DB_PASSWORD}
+      - POSTGRES_SEEDS=temporal-postgresql
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    networks:
+      - temporal
+
+volumes:
+  postgres-volume:
+  postiz-redis-data:
+  postiz-config:
+  postiz-uploads:
+  temporal-postgres-volume:
+
+networks:
+  internal:
+  temporal:
+  traefik:
+    external: true
